@@ -272,7 +272,7 @@ app.get('/id/:id', (req, res) => {
       <div class="idno">ID: ${esc(c.idNo)}</div>
       <div class="status ${expired ? 'bad' : 'ok'}">${expired ? '⚠️ License expired — verify with the school office' : '✅ Verified — active ' + (c.type === 'staff' ? 'staff member' : 'student')}</div>
     </div>
-    <div class="foot">Issued via ${BRAND.product} by ${BRAND.company}</div>
+    <div class="foot">Issued by ${esc(c.schoolName)} · Powered by ${BRAND.company}</div>
   </div>
   </body></html>`);
 });

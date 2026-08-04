@@ -1,0 +1,16 @@
+{
+  "name": "beat-sms-hosting-service",
+  "version": "1.0.0",
+  "description": "BEAT SMS (by Beat Digital Consult) — hosted service for permanent, verifiable Digital ID Card links (student & staff) and cloud data backup, backed by MongoDB Atlas.",
+  "main": "server.js",
+  "engines": { "node": ">=18.0.0" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "UNLICENSED",
+  "author": "Beat Digital Consult",
+  "dependencies": {
+    "express": "^4.19.2",
+    "mongodb": "^6.10.0"
+  }
+}

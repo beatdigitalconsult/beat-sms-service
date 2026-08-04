@@ -21,6 +21,8 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { MongoClient } = require('mongodb');
+let nodemailer = null;
+try { nodemailer = require('nodemailer'); } catch (e) { /* optional dependency — /api/notify degrades gracefully without it */ }
 
 const app = express();
 
@@ -76,6 +78,7 @@ function makeRateLimiter({ windowMs, max }) {
 }
 const publicLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 120 });
 app.use(publicLimiter);
+const notifyLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 10 });
 
 // ---------------------------------------------------------------
 // CONFIG
@@ -84,6 +87,37 @@ const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI || '';
 const DB_PATH = path.join(__dirname, 'data', 'db.json');
 const BRAND = { product: 'BEAT SMS', company: 'Beat Digital Consult', site: 'https://beatdigitalconsult.com' };
+
+// ---------------------------------------------------------------
+// EMAIL RELAY — used by the Notice Board's "deliver by email" option.
+// Optional: without SMTP_* env vars set, /api/notify simply reports
+// itself unavailable and the desktop app falls back to opening the
+// admin's own email client with everyone BCC'd, so nothing breaks.
+// ---------------------------------------------------------------
+let mailTransport = null;
+function initMail() {
+  if (!nodemailer) {
+    console.warn('\n⚠️  "nodemailer" package not installed — /api/notify will be unavailable (mailto fallback still works).\n');
+    return;
+  }
+  if (!process.env.SMTP_HOST) {
+    console.warn('\n⚠️  SMTP_HOST is not set — /api/notify will be unavailable (mailto fallback still works).');
+    console.warn('   Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM to enable server-side email delivery.\n');
+    return;
+  }
+  try {
+    mailTransport = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: process.env.SMTP_SECURE === 'true',
+      auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined
+    });
+    console.log('✅ SMTP configured — /api/notify can deliver notice-board emails.');
+  } catch (e) {
+    console.error('⚠️  Could not set up SMTP transport:', e.message);
+    mailTransport = null;
+  }
+}
 
 // ---------------------------------------------------------------
 // STORAGE — MongoDB Atlas if configured, local JSON file otherwise.
@@ -169,7 +203,7 @@ function esc(s) {
 }
 function newId(prefix) { return prefix + '_' + crypto.randomBytes(8).toString('hex'); }
 
-const FIELD_LIMITS = { name: 150, idNo: 60, role: 100, sub: 100, schoolName: 150 };
+const FIELD_LIMITS = { name: 150, idNo: 60, role: 100, sub: 100, schoolName: 150, phone: 40, dob: 20, guardian: 150 };
 function validateCard(c) {
   for (const [field, max] of Object.entries(FIELD_LIMITS)) {
     if (c[field] != null && String(c[field]).length > max) return `Field "${field}" is too long.`;
@@ -254,6 +288,9 @@ app.get('/id/:id', (req, res) => {
     .name{font-size:19px;font-weight:800;color:#0d0d63;}
     .role{font-size:13px;color:#666;margin-top:2px;}
     .idno{display:inline-block;margin-top:14px;font-family:'Courier New',monospace;background:#f2f2f8;color:#0d0d63;padding:6px 14px;border-radius:8px;font-size:13px;font-weight:700;letter-spacing:.5px;}
+    .extra{margin-top:16px;text-align:left;background:#f8f8fc;border-radius:10px;padding:10px 14px;}
+    .extra .l{display:flex;justify-content:space-between;font-size:12.5px;padding:4px 0;color:#333;}
+    .extra .l span:first-child{color:#888;}
     .status{margin-top:18px;padding:10px 14px;border-radius:10px;font-size:13px;font-weight:700;}
     .status.ok{background:#e6f7ee;color:#0a8a4a;}
     .status.bad{background:#fdeaea;color:#c62828;}
@@ -270,6 +307,12 @@ app.get('/id/:id', (req, res) => {
       <div class="name">${esc(c.name)}</div>
       <div class="role">${roleLine}</div>
       <div class="idno">ID: ${esc(c.idNo)}</div>
+      ${(c.phone || c.dob || c.guardian) ? `
+      <div class="extra">
+        ${c.phone ? `<div class="l"><span>Phone</span><span>${esc(c.phone)}</span></div>` : ''}
+        ${c.dob ? `<div class="l"><span>Date of birth</span><span>${esc(new Date(c.dob).toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'}))}</span></div>` : ''}
+        ${c.guardian ? `<div class="l"><span>Guardian</span><span>${esc(c.guardian)}</span></div>` : ''}
+      </div>` : ''}
       <div class="status ${expired ? 'bad' : 'ok'}">${expired ? '⚠️ License expired — verify with the school office' : '✅ Verified — active ' + (c.type === 'staff' ? 'staff member' : 'student')}</div>
     </div>
     <div class="foot">Issued by ${esc(c.schoolName)} · Powered by ${BRAND.company}</div>
@@ -283,6 +326,37 @@ function notFoundPage() {
   <style>body{font-family:Segoe UI,Arial,sans-serif;background:#0d0d63;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:24px}</style>
   </head><body><div><h2>⚠️ ID card not found</h2><p>This link is invalid, or the card hasn't been published to the cloud yet.</p></div></body></html>`;
 }
+
+// ---------------------------------------------------------------
+// NOTICE BOARD EMAIL DELIVERY (called by the BEAT SMS desktop app)
+// ---------------------------------------------------------------
+app.post('/api/notify', notifyLimiter, async (req, res) => {
+  if (!mailTransport) {
+    return res.status(503).json({ ok: false, error: 'Email delivery is not configured on this server yet. Set SMTP_* environment variables to enable it.' });
+  }
+  const { schoolName, subject, message, recipients } = req.body || {};
+  if (!Array.isArray(recipients) || !recipients.length) {
+    return res.status(400).json({ ok: false, error: 'No recipients provided.' });
+  }
+  const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const clean = [...new Set(recipients.filter(e => typeof e === 'string' && emailRe.test(e)))].slice(0, 500);
+  if (!clean.length) return res.status(400).json({ ok: false, error: 'No valid email addresses among the recipients.' });
+  if (!subject || !message) return res.status(400).json({ ok: false, error: 'Missing subject or message.' });
+
+  try {
+    await mailTransport.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: process.env.SMTP_FROM || process.env.SMTP_USER,   // primary "to" is the sender; real recipients ride on bcc
+      bcc: clean,
+      subject: `[${esc(schoolName || BRAND.product)}] ${esc(subject)}`,
+      text: `${message}\n\n— ${schoolName || BRAND.product}\nSent via ${BRAND.product} (${BRAND.company})`
+    });
+    res.json({ ok: true, sent: clean.length });
+  } catch (e) {
+    console.error('Email send error:', e.message);
+    res.status(500).json({ ok: false, error: 'Could not send email — check SMTP settings.' });
+  }
+});
 
 // ---------------------------------------------------------------
 // FULL SCHOOL DATA BACKUP — keyed by the school's BEAT SMS license
@@ -308,6 +382,7 @@ app.get('/api/backup/:schoolKey', (req, res) => {
 // ---------------------------------------------------------------
 async function boot() {
   await initMongo();
+  initMail();
   DB = await loadDB();
   app.listen(PORT, () => {
     console.log(`${BRAND.product} hosting-service listening on port ${PORT}`);

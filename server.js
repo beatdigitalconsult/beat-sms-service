@@ -378,6 +378,75 @@ app.get('/api/backup/:schoolKey', (req, res) => {
 });
 
 // ---------------------------------------------------------------
+// PAYSTACK VERIFICATION — called after the desktop app's Paystack
+// inline popup completes, so a payment is only ever recorded once
+// Paystack itself confirms it server-side (never trusted from the
+// browser alone). Optional: without PAYSTACK_SECRET_KEY set, this
+// simply reports itself unavailable and the app tells the admin to
+// record the payment manually instead.
+// ---------------------------------------------------------------
+app.post('/api/paystack/verify', notifyLimiter, async (req, res) => {
+  const secret = process.env.PAYSTACK_SECRET_KEY;
+  if (!secret) {
+    return res.status(503).json({ ok: false, error: 'Paystack verification is not configured on this server yet. Set PAYSTACK_SECRET_KEY to enable it.' });
+  }
+  const { reference } = req.body || {};
+  if (!reference || typeof reference !== 'string') {
+    return res.status(400).json({ ok: false, error: 'Missing transaction reference.' });
+  }
+  try {
+    const r = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`, {
+      headers: { Authorization: `Bearer ${secret}` }
+    });
+    const data = await r.json();
+    if (!data || !data.status || !data.data) {
+      return res.status(502).json({ ok: false, error: 'Unexpected response from Paystack.' });
+    }
+    res.json({ ok: true, status: data.data.status, amount: data.data.amount, currency: data.data.currency, reference: data.data.reference });
+  } catch (e) {
+    console.error('Paystack verify error:', e.message);
+    res.status(502).json({ ok: false, error: 'Could not reach Paystack to verify this transaction.' });
+  }
+});
+
+// ---------------------------------------------------------------
+// ANALYTICS "ASK YOUR DATA" — optional AI-backed answer for the
+// Analytics page's assistant. Without ANTHROPIC_API_KEY set, this
+// reports itself unavailable and the desktop app instantly falls
+// back to its own offline rule-based answer engine, so the feature
+// always works either way.
+// ---------------------------------------------------------------
+app.post('/api/insights', notifyLimiter, async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return res.status(503).json({ ok: false, error: 'AI-backed insights are not configured on this server. The app will answer using its built-in offline logic instead.' });
+  }
+  const { question, summary } = req.body || {};
+  if (!question || typeof question !== 'string' || question.length > 500) {
+    return res.status(400).json({ ok: false, error: 'Missing or invalid question.' });
+  }
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 300,
+        system: 'You are a concise school-data assistant inside BEAT SMS. Answer only from the summary numbers given. If the summary lacks what is needed, say so plainly. Keep answers under 3 sentences.',
+        messages: [{ role: 'user', content: `School data summary: ${JSON.stringify(summary || {})}\n\nQuestion: ${question}` }]
+      })
+    });
+    const data = await r.json();
+    const answer = data?.content?.find(c => c.type === 'text')?.text;
+    if (!answer) return res.status(502).json({ ok: false, error: 'No answer returned.' });
+    res.json({ ok: true, answer });
+  } catch (e) {
+    console.error('Insights error:', e.message);
+    res.status(502).json({ ok: false, error: 'Could not reach the AI service.' });
+  }
+});
+
+// ---------------------------------------------------------------
 // BOOT
 // ---------------------------------------------------------------
 async function boot() {
